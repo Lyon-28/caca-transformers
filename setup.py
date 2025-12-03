@@ -34,4 +34,8 @@ setup(
     extras_require={
         "flash-attn": ["flash-attn>=2.0.0"],
     },
+    project_urls={
+        "Bug Tracker": "https://github.com/Lyon-28/caca-transformers/issues",
+        "Source Code": "https://github.com/Lyon-28/caca-transformers",
+    },
 )
