@@ -1,8 +1,8 @@
 """
-Caca Transformers - Modern Transformer Architecture
-====================================================
+Caca Transformers - Arsitektur Transformer Modern
+==================================================
 
-A modern transformer implementation featuring:
+Fitur:
 - Grouped Query Attention (GQA)
 - Rotary Position Embeddings (RoPE)
 - SwiGLU Activation
@@ -10,12 +10,12 @@ A modern transformer implementation featuring:
 - Sliding Window Attention
 - Flash Attention Support
 
-Example usage:
+Contoh penggunaan:
     >>> from caca_transformers import CacaForCausalLM, CacaConfig
     >>> config = CacaConfig()
     >>> model = CacaForCausalLM(config)
     
-    # Or load from pretrained
+    # Atau load dari pretrained
     >>> model = CacaForCausalLM.from_pretrained("Caca-AI/caca-1b")
 """
 
@@ -48,33 +48,25 @@ from .utils import (
     estimate_training_time,
     list_all_variants,
     compare_variants,
+    get_variant_info,
 )
 
 __all__ = [
-    # Version info
     "__version__",
     "__author__",
     "__email__",
     "__description__",
     "__url__",
     "__license__",
-    
-    # Configuration
     "CacaConfig",
-    
-    # Models
     "CacaModel",
     "CacaForCausalLM",
     "CacaPreTrainedModel",
-    
-    # Components
     "CacaAttention",
     "CacaMLP",
     "CacaDecoderLayer",
     "CacaRMSNorm",
     "CacaRotaryEmbedding",
-    
-    # Utilities
     "create_caca_model",
     "CACA_VARIANTS",
     "estimate_training_tokens",
@@ -83,72 +75,155 @@ __all__ = [
     "estimate_training_time",
     "list_all_variants",
     "compare_variants",
+    "get_variant_info",
+    "get_available_backends",
+    "print_backend_info",
 ]
 
-# Register with transformers AutoClasses
-try:
-    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
-    from transformers.utils import logging
-    
-    logger = logging.get_logger(__name__)
-    
-    # Register configuration
-    AutoConfig.register("caca", CacaConfig)
-    
-    # Register models
-    AutoModel.register(CacaConfig, CacaModel)
-    AutoModelForCausalLM.register(CacaConfig, CacaForCausalLM)
-    
-    logger.info("✅ Caca models registered with Transformers AutoClasses")
-    
-except ImportError:
-    import warnings
-    warnings.warn(
-        "transformers not found. AutoModel registration skipped. "
-        "Install with: pip install transformers>=4.35.0"
-    )
 
-# Check for optional dependencies
-def _check_optional_dependencies():
-    """Check and log available optional dependencies"""
-    import warnings
+def _register_for_auto_class():
+    """Register model dengan transformers AutoClasses"""
+    try:
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+        
+        try:
+            existing = AutoConfig.for_model("caca")
+            return
+        except KeyError:
+            pass
+        
+        AutoConfig.register("caca", CacaConfig)
+        AutoModel.register(CacaConfig, CacaModel)
+        AutoModelForCausalLM.register(CacaConfig, CacaForCausalLM)
+        
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+
+_register_for_auto_class()
+
+def get_available_backends():
+    """
+    Cek backend attention optimization yang tersedia.
+    
+    Returns:
+        dict: Dictionary dengan informasi backend
+        
+    Contoh:
+        >>> from caca_transformers import get_available_backends
+        >>> backends = get_available_backends()
+        >>> print(backends)
+        {'flash_attn': True, 'xformers': False, 'sdpa': True, 'cuda': True}
+    """
+    backends = {}
     
     try:
         import torch
-        if not torch.cuda.is_available():
-            warnings.warn("CUDA not available. Models will run on CPU (much slower).")
+        backends['pytorch'] = True
+        backends['cuda'] = torch.cuda.is_available()
+        backends['pytorch_version'] = torch.__version__
     except ImportError:
-        warnings.warn("PyTorch not found. Install with: pip install torch>=2.0.0")
-    
-    # Check for optimization backends
-    backends = []
+        backends['pytorch'] = False
+        backends['cuda'] = False
+        backends['pytorch_version'] = None
     
     try:
         import flash_attn
-        backends.append("Flash Attention")
+        backends['flash_attn'] = True
+        backends['flash_attn_version'] = flash_attn.__version__
     except ImportError:
-        pass
+        backends['flash_attn'] = False
+        backends['flash_attn_version'] = None
     
     try:
         import xformers
-        backends.append("xFormers")
+        backends['xformers'] = True
+        backends['xformers_version'] = xformers.__version__
     except ImportError:
-        pass
+        backends['xformers'] = False
+        backends['xformers_version'] = None
     
     try:
         import torch.nn.functional as F
-        if hasattr(F, 'scaled_dot_product_attention'):
-            backends.append("PyTorch SDPA")
+        backends['sdpa'] = hasattr(F, 'scaled_dot_product_attention')
     except:
-        pass
+        backends['sdpa'] = False
     
-    if backends:
-        print(f"✅ Available attention backends: {', '.join(backends)}")
+    return backends
+
+
+def print_backend_info():
+    """
+    Print informasi tentang backend optimization yang tersedia.
+    
+    Contoh:
+        >>> from caca_transformers import print_backend_info
+        >>> print_backend_info()
+    """
+    backends = get_available_backends()
+    
+    print("\n🔧 Caca Transformers - Informasi Backend")
+    print("=" * 50)
+    
+    if backends['pytorch']:
+        print(f"PyTorch: ✅ {backends['pytorch_version']}")
     else:
+        print("PyTorch: ❌ Tidak terinstall")
+        print("  Install: pip install torch>=2.0.0")
+        return
+    
+    if backends['cuda']:
+        print("CUDA: ✅ Tersedia")
+    else:
+        print("CUDA: ⚠️  Tidak tersedia (CPU only)")
+    
+    if backends['flash_attn']:
+        print(f"Flash Attention: ✅ {backends['flash_attn_version']}")
+    else:
+        print("Flash Attention: ❌ Tidak terinstall (opsional)")
+        print("  Install: pip install flash-attn --no-build-isolation")
+    
+    if backends['xformers']:
+        print(f"xFormers: ✅ {backends['xformers_version']}")
+    else:
+        print("xFormers: ❌ Tidak terinstall (recommended)")
+        print("  Install: pip install xformers")
+    
+    if backends['sdpa']:
+        print("PyTorch SDPA: ✅ Tersedia")
+    else:
+        print("PyTorch SDPA: ❌ Tidak tersedia")
+        print("  Upgrade PyTorch: pip install torch>=2.0.0")
+    
+    print()
+    if backends['flash_attn']:
+        print("Backend utama: Flash Attention (4x speedup)")
+    elif backends['xformers']:
+        print("Backend utama: xFormers (3x speedup)")
+    elif backends['sdpa']:
+        print("Backend utama: PyTorch SDPA (2x speedup)")
+    else:
+        print("Backend utama: Standard Attention (baseline)")
+        print("⚠️  Pertimbangkan install xFormers untuk performa lebih baik")
+    
+    print()
+
+
+def _check_critical_dependencies():
+    """Cek dependensi critical (silent kecuali error)"""
+    try:
+        import torch
+    except ImportError:
+        import warnings
         warnings.warn(
-            "No optimized attention backend found. "
-            "Install xFormers for 3x speedup: pip install xformers"
+            "PyTorch tidak ditemukan! Caca Transformers memerlukan PyTorch.\n"
+            "Install dengan: pip install torch>=2.0.0\n"
+            "Kunjungi: https://pytorch.org/get-started/locally/",
+            ImportWarning,
+            stacklevel=2
         )
 
-# Run checks on import
-_check_optional_dependencies()
+
+_check_critical_dependencies()
