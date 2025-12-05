@@ -1,4 +1,4 @@
-"""PyTorch Caca model."""
+"""Model Caca dengan arsitektur transformer modern."""
 
 import torch
 import torch.nn as nn
@@ -15,7 +15,6 @@ from .configuration_caca import CacaConfig
 
 logger = logging.get_logger(__name__)
 
-# Check for optional dependencies
 try:
     from flash_attn import flash_attn_func
     HAS_FLASH_ATTN = True
@@ -30,9 +29,8 @@ except ImportError:
 
 HAS_SDPA = hasattr(F, 'scaled_dot_product_attention')
 
-
 class CacaRMSNorm(nn.Module):
-    """Root Mean Square Normalization"""
+
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -43,9 +41,8 @@ class CacaRMSNorm(nn.Module):
         x = x * torch.rsqrt(variance + self.eps)
         return self.weight * x
 
-
 class CacaRotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE)"""
+
     def __init__(self, dim, max_position_embeddings=8192, base=10000.0):
         super().__init__()
         self.dim = dim
@@ -55,49 +52,33 @@ class CacaRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x, seq_len, position_offset=0):
-        """
-        Args:
-            x: input tensor [batch, num_heads, seq_len, head_dim]
-            seq_len: panjang sequence
-            position_offset: offset posisi untuk KV cache
-        Returns:
-            cos, sin: [1, 1, seq_len, head_dim] dengan dtype yang sama dengan x
-        """
-        # Generate position indices
         t = torch.arange(position_offset, position_offset + seq_len, device=x.device).type_as(self.inv_freq)
-        freqs = torch.outer(t, self.inv_freq)  # [seq_len, dim/2]
-        emb = torch.cat((freqs, freqs), dim=-1)  # [seq_len, dim]
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
         
-        # Expand untuk broadcast: [1, 1, seq_len, dim]
         cos = emb.cos()[None, None, :, :]
         sin = emb.sin()[None, None, :, :]
         
         return cos.to(x.dtype), sin.to(x.dtype)
 
 def rotate_half(x):
-    """Rotasi setengah dimensi untuk RoPE"""
+
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    """
-    Aplikasikan RoPE ke query dan key
+
+    cos = cos.to(q.dtype)
+    sin = sin.to(q.dtype)
     
-    Args:
-        q, k: [batch, num_heads, seq_len, head_dim]
-        cos, sin: [1, 1, seq_len, head_dim]
-    """
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed   
-
+    return q_embed, k_embed
 
 class CacaAttention(nn.Module):
-    """Grouped Query Attention dengan multi-backend support"""
-    
+
     _backend_logged = False
-    _backend_lock = None
     
     def __init__(self, config):
         super().__init__()
@@ -109,13 +90,11 @@ class CacaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.sliding_window = config.sliding_window
 
-        # Projection layers
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         
-        # RoPE
         self.rotary_emb = CacaRotaryEmbedding(
             self.head_dim, 
             config.max_position_embeddings, 
@@ -123,41 +102,14 @@ class CacaAttention(nn.Module):
         )
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         
-        # Backend detection
         self.has_flash_attn = HAS_FLASH_ATTN and config.use_flash_attn
         self.has_xformers = HAS_XFORMERS
         self.has_sdpa = HAS_SDPA
         self._flash_attn_failed = False
+        self._xformers_warned = False
         
-        if not CacaAttention._backend_logged:
-            logger.info("=" * 60)
-            logger.info("🔧 CacaAttention Backend Configuration")
-            logger.info("=" * 60)
-            
-            if self.has_flash_attn:
-                logger.info("✅ Primary: Flash Attention (4x speedup)")
-                logger.info("   - Causal masking: native")
-                logger.info("   - Sliding window: native")
-                logger.info("   - Memory: O(N) instead of O(N²)")
-            elif self.has_xformers:
-                logger.info("✅ Primary: xFormers (3x speedup)")
-                logger.info("   - Causal masking: via attention_bias")
-                logger.info("   - Sliding window: via custom mask")
-                logger.info("   - Memory: efficient fused kernels")
-            elif self.has_sdpa:
-                logger.info("✅ Primary: PyTorch SDPA (2x speedup)")
-                logger.info("   - Causal masking: via attention_mask")
-                logger.info("   - Sliding window: via custom mask")
-                logger.info("   - Memory: fused kernel dari PyTorch 2.0+")
-            else:
-                logger.warning("⚠️  Primary: Standard Attention (baseline)")
-                logger.warning("   - No optimization")
-                logger.warning("   - Slowest performance")
-                logger.warning("   - Recommended: Install xFormers atau upgrade PyTorch")
-            
-            logger.info("=" * 60)
-            
-            CacaAttention._backend_logged = True
+        self._mask_cache = {}
+        self._max_cache_size = 10
 
     def forward(
         self, 
@@ -168,45 +120,36 @@ class CacaAttention(nn.Module):
     ):
         batch_size, seq_length, _ = hidden_states.size()
 
-        # Project ke Q, K, V
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Reshape untuk multi-head attention
         query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # Hitung position offset untuk RoPE (untuk KV cache)
         if past_key_value is not None:
-            position_offset = past_key_value[0].shape[-2]  # Panjang KV cache sebelumnya
+            position_offset = past_key_value[0].shape[-2]
         else:
             position_offset = 0
-             
-        # Aplikasikan RoPE - sekarang cos/sin sudah correct shape
+        
         cos, sin = self.rotary_emb(query_states, seq_length, position_offset)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Concatenate dengan past KV cache
         if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-        # Simpan KV cache untuk generation
         if use_cache:
             present_key_value = (key_states, value_states)
         else:
             present_key_value = None
 
-        # Repeat KV heads untuk GQA
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
 
-        # Total sequence length setelah KV cache
         kv_seq_len = key_states.shape[-2]
 
-        # Pilih attention backend
         if self.has_flash_attn and not self._flash_attn_failed and attention_mask is None:
             if (query_states.device.type == 'cuda' and 
                 query_states.dtype in [torch.float16, torch.bfloat16]):
@@ -214,7 +157,7 @@ class CacaAttention(nn.Module):
                     attn_output = self._flash_attention(query_states, key_states, value_states)
                 except Exception as e:
                     if not self._flash_attn_failed:
-                        logger.warning(f"⚠️ Flash Attention gagal: {e}, fallback ke backend lain")
+                        logger.warning(f"Flash Attention gagal: {e}, fallback ke backend lain")
                         self._flash_attn_failed = True
                     attn_output = self._fallback_attention(query_states, key_states, value_states, attention_mask, kv_seq_len)
             else:
@@ -222,113 +165,101 @@ class CacaAttention(nn.Module):
         else:
             attn_output = self._fallback_attention(query_states, key_states, value_states, attention_mask, kv_seq_len)
 
-        # Output projection
         attn_output = self.o_proj(attn_output)
         return attn_output, present_key_value
     
     def _flash_attention(self, query_states, key_states, value_states):
-        """Flash Attention implementation"""
+
         batch_size, num_heads, seq_length, head_dim = query_states.shape
         kv_seq_len = key_states.shape[-2]
         
-        # Flash Attention expects: [batch, seq_len, num_heads, head_dim]
-        query_states = query_states.transpose(1, 2).contiguous()
-        key_states = key_states.transpose(1, 2).contiguous()
-        value_states = value_states.transpose(1, 2).contiguous()
+        original_dtype = query_states.dtype
+
+        if original_dtype not in [torch.float16, torch.bfloat16]:
+            compute_dtype = torch.bfloat16
+        else:
+            compute_dtype = original_dtype
+
+        query_states = query_states.transpose(1, 2).contiguous().to(compute_dtype)
+        key_states = key_states.transpose(1, 2).contiguous().to(compute_dtype)
+        value_states = value_states.transpose(1, 2).contiguous().to(compute_dtype)
         
-        # Window size: (left_window, right_window)
-        # left = berapa token ke belakang bisa diakses
-        # right = berapa token ke depan bisa diakses (0 untuk causal)
         if self.sliding_window is not None and self.sliding_window < kv_seq_len:
             window_size = (self.sliding_window, 0)
         else:
-            window_size = (-1, 0)  # -1 = unlimited, 0 = causal
-        try:
-            attn_output = flash_attn_func(
-                query_states,
-                key_states,
-                value_states,
-                dropout_p=self.config.attention_dropout if self.training else 0.0,
-                causal=True,
-                window_size=window_size,
-            )
+            window_size = (-1, 0)
             
-            if self._flash_attn_failed:
-                logger.info("✅ Flash Attention kembali normal")
-                self._flash_attn_failed = False
-                
-        except Exception as e:
-            if not self._flash_attn_failed:
-                logger.warning(f"⚠️ Flash Attention gagal: {e}")
-                logger.warning(f"   Shapes - Q: {query_states.shape}, K: {key_states.shape}, V: {value_states.shape}")
-                logger.warning(f"   Device: {query_states.device}, Dtype: {query_states.dtype}")
-                logger.warning("   Fallback ke backend lain...")
-            
-            self._flash_attn_failed = True
-            raise 
+        attn_output = flash_attn_func(
+            query_states,
+            key_states,
+            value_states,
+            dropout_p=self.config.attention_dropout if self.training else 0.0,
+            causal=True,
+            window_size=window_size,
+        )
         
-        # Reshape back
+        if self._flash_attn_failed:
+            logger.info("Flash Attention kembali normal")
+            self._flash_attn_failed = False
+        
+        attn_output = attn_output.to(original_dtype)
         attn_output = attn_output.reshape(batch_size, seq_length, self.hidden_size)
         return attn_output
     
     def _fallback_attention(self, query_states, key_states, value_states, attention_mask, kv_seq_len):
-        """Pilih backend terbaik yang tersedia"""
+
         device_type = query_states.device.type
         
-        # Coba xFormers
         if self.has_xformers and device_type == 'cuda' and attention_mask is None:
             try:
                 return self._xformers_attention(query_states, key_states, value_states, kv_seq_len)
             except Exception as e:
                 logger.warning(f"⚠️ xFormers gagal: {e}, fallback ke SDPA")
         
-        # Coba SDPA
         if self.has_sdpa:
             return self._sdpa_attention(query_states, key_states, value_states, attention_mask, kv_seq_len)
-        
-        # Standard attention
-        return self._standard_attention(query_states, key_states, value_states, attention_mask, kv_seq_len)
+            
+            return self._standard_attention(query_states, key_states, value_states, attention_mask, kv_seq_len)
     
     def _create_causal_mask(self, query_length, key_length, dtype, device):
-        """
-        Buat causal mask dengan sliding window
+
+        cache_key = (query_length, key_length, device, self.sliding_window)
         
-        Args:
-            query_length: panjang query (biasanya 1 untuk generation, N untuk prefill)
-            key_length: panjang key (termasuk KV cache)
-        Returns:
-            mask: [1, 1, query_length, key_length]
-        """
-        # Buat indices
-        query_indices = torch.arange(key_length - query_length, key_length, device=device)
-        key_indices = torch.arange(key_length, device=device)
+        if cache_key in self._mask_cache:
+            cached_mask = self._mask_cache[cache_key]
+
+            if cached_mask.dtype != dtype:
+                return cached_mask.to(dtype)
+            return cached_mask
+            
+        if query_length > key_length:
+            raise ValueError(
+                f"query_length ({query_length}) > key_length ({key_length})"
+            )
+            
+        query_pos = torch.arange(query_length, device=device) + (key_length - query_length)
+        key_pos = torch.arange(key_length, device=device)
+        distance = query_pos[:, None] - key_pos[None, :]
         
-        # Causal mask: query token i hanya bisa attend ke key token <= i
-        # distance = query_pos - key_pos
-        distance = query_indices[:, None] - key_indices[None, :]
-        
-        # Mask future tokens (distance < 0)
-        causal_mask = distance < 0
-        
-        # Sliding window mask (distance >= window)
+        mask = distance < 0
         if self.sliding_window is not None:
-            window_mask = distance >= self.sliding_window
-            causal_mask = causal_mask | window_mask
+            too_far_mask = distance > self.sliding_window
+            mask = mask | too_far_mask
+            
+        float_mask = torch.zeros(1, 1, query_length, key_length, dtype=dtype, device=device)
+        float_mask.masked_fill_(mask, torch.finfo(dtype).min)
         
-        # Convert to float mask
-        mask = torch.zeros(1, 1, query_length, key_length, dtype=dtype, device=device)
-        mask.masked_fill_(causal_mask, torch.finfo(dtype).min)
-        
-        return mask
+        if len(self._mask_cache) < self._max_cache_size:
+            self._mask_cache[cache_key] = float_mask
+            
+        return float_mask
     
     def _xformers_attention(self, query_states, key_states, value_states, kv_seq_len):
-        """xFormers memory efficient attention"""
+
         batch_size, num_heads, seq_length, head_dim = query_states.shape
         
-        # Create causal + sliding window mask
         attn_bias = self._create_causal_mask(seq_length, kv_seq_len, query_states.dtype, query_states.device)
         
-        # xFormers expects: [batch, seq_len, num_heads, head_dim]
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
@@ -343,12 +274,11 @@ class CacaAttention(nn.Module):
         
         attn_output = attn_output.reshape(batch_size, seq_length, self.hidden_size)
         return attn_output
-    
+        
     def _sdpa_attention(self, query_states, key_states, value_states, attention_mask, kv_seq_len):
-        """PyTorch Scaled Dot Product Attention"""
+
         batch_size, num_heads, seq_length, head_dim = query_states.shape
         
-        # Create causal + sliding window mask jika belum ada
         if attention_mask is None:
             attention_mask = self._create_causal_mask(seq_length, kv_seq_len, query_states.dtype, query_states.device)
         
@@ -358,7 +288,7 @@ class CacaAttention(nn.Module):
             value_states,
             attn_mask=attention_mask,
             dropout_p=self.config.attention_dropout if self.training else 0.0,
-            is_causal=False,  # Karena kita sudah provide mask
+            is_causal=False,
         )
         
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -366,32 +296,32 @@ class CacaAttention(nn.Module):
         return attn_output
         
     def _standard_attention(self, query_states, key_states, value_states, attention_mask, kv_seq_len):
-        """Standard scaled dot-product attention"""
+
         batch_size, num_heads, seq_length, head_dim = query_states.shape
         
-        # Hitung attention scores
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
         
-        # Apply mask
         if attention_mask is None:
             attention_mask = self._create_causal_mask(seq_length, kv_seq_len, attn_weights.dtype, attn_weights.device)
         
         attn_weights = attn_weights + attention_mask
 
-        # Softmax
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = self.attention_dropout(attn_weights)
 
-        # Weighted sum
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_length, self.hidden_size)
         
-        return attn_output 
-    
+        if self.training and not self.config.use_cache:
+            del attn_weights
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return attn_output
 
 class CacaMLP(nn.Module):
-    """SwiGLU Feedforward Network"""
+
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -403,17 +333,15 @@ class CacaMLP(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x):
-        # SwiGLU: Swish(gate) * up
         gate = F.silu(self.gate_proj(x))
         up = self.up_proj(x)
         hidden = gate * up
         hidden = self.dropout(hidden)
         output = self.down_proj(hidden)
-        return output  
-    
+        return output
 
 class CacaDecoderLayer(nn.Module):
-    """Single decoder layer: Attention + FFN dengan residual connections"""
+
     def __init__(self, config):
         super().__init__()
         self.self_attn = CacaAttention(config)
@@ -422,7 +350,6 @@ class CacaDecoderLayer(nn.Module):
         self.post_attention_layernorm = CacaRMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(self, hidden_states, attention_mask=None, past_key_value=None, use_cache=False):
-        # Self attention dengan residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, present_key_value = self.self_attn(
@@ -433,7 +360,6 @@ class CacaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # FFN dengan residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -441,9 +367,8 @@ class CacaDecoderLayer(nn.Module):
 
         return hidden_states, present_key_value
 
-
 class CacaPreTrainedModel(PreTrainedModel):
-    """Base class for all Caca models"""
+
     config_class = CacaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -451,7 +376,6 @@ class CacaPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = "past_key_values"
 
     def _init_weights(self, module):
-        """Initialize weights"""
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
@@ -462,9 +386,8 @@ class CacaPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-
 class CacaModel(CacaPreTrainedModel):
-    """Model Caca utama (tanpa LM head)"""
+
     def __init__(self, config):
         super().__init__(config)
         self.config = config
@@ -481,19 +404,16 @@ class CacaModel(CacaPreTrainedModel):
         self.embed_tokens = value
     
     def _prepare_attention_mask(self, attention_mask, input_shape, dtype):
-        """Prepare attention mask untuk model"""
         if attention_mask is None:
             return None
         
         batch_size, seq_length = input_shape
         
-        # Expand dimensions
         if attention_mask.dim() == 2:
             attention_mask = attention_mask[:, None, None, :]
         elif attention_mask.dim() == 3:
             attention_mask = attention_mask[:, None, :, :]
         
-        # Convert ke format attention (0 = attend, large negative = tidak attend)
         attention_mask = attention_mask.to(dtype=dtype)
         attention_mask = (1.0 - attention_mask) * torch.finfo(dtype).min
         
@@ -511,9 +431,7 @@ class CacaModel(CacaPreTrainedModel):
             raise ValueError("input_ids tidak boleh None")
             
         if not torch.is_tensor(input_ids):
-            raise TypeError( 
-                f"input_ids harus torch.Tensor, dapat {type(input_ids)}"
-            )
+            raise TypeError(f"input_ids harus torch.Tensor, dapat {type(input_ids)}")
         
         if input_ids.dim() != 2:
             raise ValueError(
@@ -523,38 +441,31 @@ class CacaModel(CacaPreTrainedModel):
             
         if input_ids.dtype not in [torch.long, torch.int, torch.int32, torch.int64]:
             raise TypeError(
-                f"input_ids harus integer dtype (torch.long/int), "
-                f"dapat {input_ids.dtype}. "
-                f"Hint: Gunakan input_ids.long() untuk convert."
+                f"input_ids harus integer dtype, dapat {input_ids.dtype}. "
+                f"Gunakan input_ids.long() untuk convert."
             )
             
         if (input_ids < 0).any():
             min_val = input_ids.min().item()
-            raise ValueError(
-                f"input_ids mengandung nilai negatif: {min_val}. "
-                f"Token IDs harus >= 0."
-            )
+            raise ValueError(f"input_ids mengandung nilai negatif: {min_val}")
             
         if (input_ids >= self.config.vocab_size).any():
             max_val = input_ids.max().item()
             raise ValueError(
                 f"input_ids mengandung nilai >= vocab_size. "
-                f"Max value: {max_val}, vocab_size: {self.config.vocab_size}. "
-                f"Hint: Pastikan tokenizer vocab_size match dengan model config."
+                f"Max value: {max_val}, vocab_size: {self.config.vocab_size}"
             )
             
         batch_size, seq_length = input_ids.shape
         if seq_length > self.config.max_position_embeddings:
             logger.warning(
-                f"⚠️ Sequence length ({seq_length}) > max_position_embeddings "
-                f"({self.config.max_position_embeddings}). "
-                f"RoPE extrapolation mungkin tidak optimal."
+                f"Sequence length ({seq_length}) > max_position_embeddings "
+                f"({self.config.max_position_embeddings})"
             )
             
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         hidden_states = self.embed_tokens(input_ids)
         
-        # Prepare attention mask
         if attention_mask is not None:
             attention_mask = self._prepare_attention_mask(
                 attention_mask, 
@@ -562,26 +473,21 @@ class CacaModel(CacaPreTrainedModel):
                 hidden_states.dtype
             )
             
-        # Initialize past_key_values
         if use_cache and past_key_values is None:
             past_key_values = tuple([None] * len(self.layers))
         
         present_key_values = [] if use_cache else None
         
-        # Loop melalui semua decoder layers
         for idx, layer in enumerate(self.layers):
             past_key_value = past_key_values[idx] if past_key_values is not None else None
             
-            # Gradient checkpointing (hanya saat training tanpa KV cache)
             if self.gradient_checkpointing and self.training and past_key_value is None:
                 hidden_states = self._gradient_checkpointing_forward(
                     layer,
                     hidden_states,
                     attention_mask,
                 )
-                
                 present_key_value = None
-                
             else:
                 hidden_states, present_key_value = layer(
                     hidden_states, 
@@ -593,7 +499,6 @@ class CacaModel(CacaPreTrainedModel):
             if use_cache:
                 present_key_values.append(present_key_value)
         
-        # Final layer norm
         hidden_states = self.norm(hidden_states)
         
         return {
@@ -602,7 +507,6 @@ class CacaModel(CacaPreTrainedModel):
         }
 
     def _gradient_checkpointing_forward(self, layer, hidden_states, attention_mask):
-        """Forward pass dengan gradient checkpointing untuk save memory"""
         from torch.utils.checkpoint import checkpoint
         
         def create_custom_forward(module):
@@ -624,11 +528,10 @@ class CacaModel(CacaPreTrainedModel):
             use_reentrant=False,
         )
         
-        return hidden_states  
-    
+        return hidden_states
 
 class CacaForCausalLM(CacaPreTrainedModel, GenerationMixin):
-    """Model Caca untuk causal language modeling"""
+
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
@@ -670,7 +573,6 @@ class CacaForCausalLM(CacaPreTrainedModel, GenerationMixin):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        # Forward pass melalui model
         outputs = self.model(
             input_ids, 
             attention_mask=attention_mask,
@@ -689,7 +591,7 @@ class CacaForCausalLM(CacaPreTrainedModel, GenerationMixin):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            output = (logits,) + tuple(v for v in outputs.values() if v is not None)
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithPast(
