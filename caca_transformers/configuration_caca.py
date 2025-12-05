@@ -1,5 +1,6 @@
-"""Caca model configuration"""
+"""Konfigurasi model Caca"""
 
+import warnings
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
@@ -7,60 +8,30 @@ logger = logging.get_logger(__name__)
 
 
 class CacaConfig(PretrainedConfig):
-    r"""
-    Configuration class for Caca models.
-    
-    This is the configuration class to store the configuration of a :class:`~CacaModel` or a
-    :class:`~CacaForCausalLM`. It is used to instantiate a Caca model according to the specified
-    arguments, defining the model architecture.
-    
-    Configuration objects inherit from :class:`~transformers.PretrainedConfig` and can be used to
-    control the model outputs. Read the documentation from :class:`~transformers.PretrainedConfig`
-    for more information.
+    """
+    Konfigurasi untuk model Caca.
     
     Args:
-        vocab_size (:obj:`int`, `optional`, defaults to 100000):
-            Vocabulary size of the model.
-        hidden_size (:obj:`int`, `optional`, defaults to 2048):
-            Dimensionality of the hidden representations.
-        num_hidden_layers (:obj:`int`, `optional`, defaults to 24):
-            Number of hidden layers in the Transformer encoder.
-        num_attention_heads (:obj:`int`, `optional`, defaults to 16):
-            Number of attention heads for each attention layer.
-        num_key_value_heads (:obj:`int`, `optional`, defaults to 4):
-            Number of key-value heads for Grouped Query Attention (GQA).
-        intermediate_size (:obj:`int`, `optional`, defaults to 5632):
-            Dimensionality of the "intermediate" (often called FFN) layer.
-        max_position_embeddings (:obj:`int`, `optional`, defaults to 8192):
-            Maximum sequence length that this model might ever be used with.
-        rms_norm_eps (:obj:`float`, `optional`, defaults to 1e-6):
-            The epsilon used by the RMS normalization layers.
-        rope_theta (:obj:`float`, `optional`, defaults to 10000.0):
-            The base period of the RoPE embeddings.
-        attention_dropout (:obj:`float`, `optional`, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
-        hidden_dropout (:obj:`float`, `optional`, defaults to 0.0):
-            The dropout ratio for the hidden states.
-        sliding_window (:obj:`int`, `optional`, defaults to 4096):
-            Sliding window attention size. If None, full attention is used.
-        initializer_range (:obj:`float`, `optional`, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer.
-        use_flash_attn (:obj:`bool`, `optional`, defaults to False):
-            Whether to use Flash Attention for faster computation.
-        use_cache (:obj:`bool`, `optional`, defaults to True):
-            Whether the model should return the last key/values attentions.
-    
-    Example:
-        >>> from caca_transformers import CacaConfig, CacaForCausalLM
-        >>> 
-        >>> # Initializing a Caca-1B configuration
-        >>> configuration = CacaConfig()
-        >>> 
-        >>> # Initializing a model from the configuration
-        >>> model = CacaForCausalLM(configuration)
-        >>> 
-        >>> # Accessing the model configuration
-        >>> configuration = model.config
+        vocab_size: Ukuran vocabulary
+        hidden_size: Dimensi hidden state
+        num_hidden_layers: Jumlah layer
+        num_attention_heads: Jumlah attention heads
+        num_key_value_heads: Jumlah KV heads untuk GQA
+        intermediate_size: Dimensi FFN intermediate
+        max_position_embeddings: Panjang maksimal sequence
+        rms_norm_eps: Epsilon untuk RMSNorm
+        rope_theta: Base period untuk RoPE
+        attention_dropout: Dropout untuk attention
+        hidden_dropout: Dropout untuk hidden states
+        sliding_window: Ukuran sliding window attention
+        initializer_range: Std dev untuk inisialisasi weights
+        use_flash_attn: Gunakan Flash Attention
+        use_cache: Return KV cache untuk generation
+        rope_scaling: Konfigurasi RoPE scaling
+        attention_bias: Bias di attention projections
+        mlp_bias: Bias di MLP projections
+        residual_dropout: Dropout untuk residual connections
+        pretraining_tp: Tensor parallelism rank
     """
     
     model_type = "caca"
@@ -87,9 +58,13 @@ class CacaConfig(PretrainedConfig):
         bos_token_id=1,
         eos_token_id=2,
         tie_word_embeddings=True,
+        rope_scaling=None,
+        attention_bias=False,
+        mlp_bias=False,
+        residual_dropout=0.0,
+        pretraining_tp=1,
         **kwargs,
     ):
-        # Validation
         self._validate_config(
             vocab_size, hidden_size, num_hidden_layers, num_attention_heads,
             num_key_value_heads, intermediate_size, max_position_embeddings,
@@ -115,6 +90,12 @@ class CacaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.head_dim = hidden_size // num_attention_heads
         
+        self.rope_scaling = rope_scaling
+        self.attention_bias = attention_bias
+        self.mlp_bias = mlp_bias
+        self.residual_dropout = residual_dropout
+        self.pretraining_tp = pretraining_tp
+        
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -129,45 +110,40 @@ class CacaConfig(PretrainedConfig):
         rms_norm_eps, rope_theta, attention_dropout, hidden_dropout,
         sliding_window, initializer_range, bos_token_id, eos_token_id, pad_token_id
     ):
-        """Validate configuration parameters"""
-        import warnings
+        """Validasi parameter konfigurasi"""
         
-        # Basic validations
         if vocab_size <= 0:
-            raise ValueError(f"vocab_size must be > 0, got: {vocab_size}")
+            raise ValueError(f"vocab_size harus > 0, dapat: {vocab_size}")
         if hidden_size <= 0:
-            raise ValueError(f"hidden_size must be > 0, got: {hidden_size}")
+            raise ValueError(f"hidden_size harus > 0, dapat: {hidden_size}")
         if num_hidden_layers <= 0:
-            raise ValueError(f"num_hidden_layers must be > 0, got: {num_hidden_layers}")
+            raise ValueError(f"num_hidden_layers harus > 0, dapat: {num_hidden_layers}")
         if num_attention_heads <= 0:
-            raise ValueError(f"num_attention_heads must be > 0, got: {num_attention_heads}")
+            raise ValueError(f"num_attention_heads harus > 0, dapat: {num_attention_heads}")
         if num_key_value_heads <= 0:
-            raise ValueError(f"num_key_value_heads must be > 0, got: {num_key_value_heads}")
+            raise ValueError(f"num_key_value_heads harus > 0, dapat: {num_key_value_heads}")
         
-        # Head dimension validation
         if hidden_size % num_attention_heads != 0:
             raise ValueError(
-                f"hidden_size ({hidden_size}) must be divisible by "
+                f"hidden_size ({hidden_size}) harus habis dibagi "
                 f"num_attention_heads ({num_attention_heads})"
             )
         
-        # GQA validation
         if num_attention_heads % num_key_value_heads != 0:
             raise ValueError(
-                f"num_attention_heads ({num_attention_heads}) must be divisible by "
-                f"num_key_value_heads ({num_key_value_heads}) for GQA"
+                f"num_attention_heads ({num_attention_heads}) harus habis dibagi "
+                f"num_key_value_heads ({num_key_value_heads}) untuk GQA"
             )
         
         head_dim = hidden_size // num_attention_heads
         if head_dim % 2 != 0:
-            raise ValueError(f"head_dim ({head_dim}) must be even for RoPE")
+            raise ValueError(f"head_dim ({head_dim}) harus genap untuk RoPE")
         
-        # Warnings for suboptimal configurations
         if head_dim < 32:
-            warnings.warn(f"head_dim ({head_dim}) is very small. Recommended minimum: 64")
+            warnings.warn(f"head_dim ({head_dim}) sangat kecil. Recommended minimum: 64")
         
         if sliding_window is not None and sliding_window > max_position_embeddings:
             raise ValueError(
-                f"sliding_window ({sliding_window}) cannot be larger than "
+                f"sliding_window ({sliding_window}) tidak boleh > "
                 f"max_position_embeddings ({max_position_embeddings})"
             )
